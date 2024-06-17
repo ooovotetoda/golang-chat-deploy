@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 type Message struct {
+	ID     string `json:"id"`
 	Author string `json:"author"`
 	Text   string `json:"text"`
 }
@@ -51,6 +53,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			mutex.Unlock()
 			break
 		}
+		msg.ID = uuid.New().String()
 		broadcast <- msg
 	}
 }
