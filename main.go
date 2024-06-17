@@ -75,6 +75,6 @@ func main() {
 	http.HandleFunc("/ws", wsHandler)
 	go handleMessages()
 
-	log.Println("Server started on :80")
-	log.Fatal(http.ListenAndServe(":80", nil))
+	log.Println("Server started on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
