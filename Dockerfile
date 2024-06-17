@@ -20,6 +20,6 @@ COPY --from=builder /app/websocket-server .
 
 RUN ls -la
 
-EXPOSE 8080
+EXPOSE 80
 
 CMD ["./websocket-server"]
