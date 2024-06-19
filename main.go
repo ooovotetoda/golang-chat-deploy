@@ -1,12 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"log"
 	"net/http"
 	"sync"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Message struct {
@@ -32,51 +34,103 @@ var rooms = make(map[string]*Room)
 var broadcast = make(chan Message)
 var mutex = &sync.Mutex{}
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-	roomID := r.URL.Query().Get("room")
-	if roomID == "" {
-		http.Error(w, "Room ID is required", http.StatusBadRequest)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+func initDB() *sql.DB {
+	db, err := sql.Open("sqlite3", "./chat.db")
 	if err != nil {
-		log.Println("Upgrade error:", err)
-		return
+		log.Fatal(err)
 	}
-	defer conn.Close()
 
-	mutex.Lock()
-	if _, ok := rooms[roomID]; !ok {
-		rooms[roomID] = &Room{Clients: make(map[*websocket.Conn]bool)}
+	createTableQuery := `CREATE TABLE IF NOT EXISTS messages (
+		id TEXT PRIMARY KEY,
+		author TEXT,
+		text TEXT,
+		room TEXT
+	);`
+
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Fatal(err)
 	}
-	rooms[roomID].Clients[conn] = true
-	mutex.Unlock()
 
-	for {
-		var msg Message
-		err := conn.ReadJSON(&msg)
+	return db
+}
+
+func wsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		roomID := r.URL.Query().Get("room")
+		if roomID == "" {
+			http.Error(w, "Room ID is required", http.StatusBadRequest)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("Read error:", err)
+			log.Println("Upgrade error:", err)
+			return
+		}
+		defer conn.Close()
+
+		mutex.Lock()
+		if _, ok := rooms[roomID]; !ok {
+			rooms[roomID] = &Room{Clients: make(map[*websocket.Conn]bool)}
+		}
+		rooms[roomID].Clients[conn] = true
+		mutex.Unlock()
+
+		rows, err := db.Query("SELECT id, author, text, room FROM messages WHERE room = ?", roomID)
+		if err != nil {
+			log.Println("Database query error:", err)
+		}
+		defer rows.Close()
+
+		var messages []Message
+		for rows.Next() {
+			var msg Message
+			err := rows.Scan(&msg.ID, &msg.Author, &msg.Text, &msg.Room)
+			if err != nil {
+				log.Println("Database scan error:", err)
+			}
+			messages = append(messages, msg)
+		}
+
+		err = conn.WriteJSON(messages)
+		if err != nil {
+			log.Println("Write error:", err)
+			conn.Close()
 			mutex.Lock()
 			delete(rooms[roomID].Clients, conn)
 			if len(rooms[roomID].Clients) == 0 {
 				delete(rooms, roomID)
 			}
 			mutex.Unlock()
-			break
+			return
 		}
-		msg.ID = uuid.New().String()
-		msg.Room = roomID
-		broadcast <- msg
+
+		for {
+			var msg Message
+			err := conn.ReadJSON(&msg)
+			if err != nil {
+				log.Println("Read error:", err)
+				mutex.Lock()
+				delete(rooms[roomID].Clients, conn)
+				if len(rooms[roomID].Clients) == 0 {
+					delete(rooms, roomID)
+				}
+				mutex.Unlock()
+				break
+			}
+			msg.ID = uuid.New().String()
+			msg.Room = roomID
+			broadcast <- msg
+		}
 	}
 }
 
-func handleMessages() {
+func handleMessages(db *sql.DB) {
 	for {
 		msg := <-broadcast
 		mutex.Lock()
@@ -94,12 +148,20 @@ func handleMessages() {
 			}
 		}
 		mutex.Unlock()
+
+		_, err := db.Exec("INSERT INTO messages (id, author, text, room) VALUES (?, ?, ?, ?)", msg.ID, msg.Author, msg.Text, msg.Room)
+		if err != nil {
+			log.Println("Database insert error:", err)
+		}
 	}
 }
 
 func main() {
-	http.HandleFunc("/ws", wsHandler)
-	go handleMessages()
+	db := initDB()
+	defer db.Close()
+
+	http.HandleFunc("/ws", wsHandler(db))
+	go handleMessages(db)
 
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
