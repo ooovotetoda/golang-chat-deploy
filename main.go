@@ -13,6 +13,11 @@ type Message struct {
 	ID     string `json:"id"`
 	Author string `json:"author"`
 	Text   string `json:"text"`
+	Room   string `json:"room"`
+}
+
+type Room struct {
+	Clients map[*websocket.Conn]bool
 }
 
 var upgrader = websocket.Upgrader{
@@ -23,7 +28,7 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-var clients = make(map[*websocket.Conn]bool)
+var rooms = make(map[string]*Room)
 var broadcast = make(chan Message)
 var mutex = &sync.Mutex{}
 
@@ -31,6 +36,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		http.Error(w, "Room ID is required", http.StatusBadRequest)
+		return
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -40,7 +51,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	mutex.Lock()
-	clients[conn] = true
+	if _, ok := rooms[roomID]; !ok {
+		rooms[roomID] = &Room{Clients: make(map[*websocket.Conn]bool)}
+	}
+	rooms[roomID].Clients[conn] = true
 	mutex.Unlock()
 
 	for {
@@ -49,11 +63,15 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Println("Read error:", err)
 			mutex.Lock()
-			delete(clients, conn)
+			delete(rooms[roomID].Clients, conn)
+			if len(rooms[roomID].Clients) == 0 {
+				delete(rooms, roomID)
+			}
 			mutex.Unlock()
 			break
 		}
 		msg.ID = uuid.New().String()
+		msg.Room = roomID
 		broadcast <- msg
 	}
 }
@@ -62,12 +80,17 @@ func handleMessages() {
 	for {
 		msg := <-broadcast
 		mutex.Lock()
-		for client := range clients {
-			err := client.WriteJSON(msg)
-			if err != nil {
-				log.Println("Write error:", err)
-				client.Close()
-				delete(clients, client)
+		if room, ok := rooms[msg.Room]; ok {
+			for client := range room.Clients {
+				err := client.WriteJSON(msg)
+				if err != nil {
+					log.Println("Write error:", err)
+					client.Close()
+					delete(room.Clients, client)
+					if len(room.Clients) == 0 {
+						delete(rooms, msg.Room)
+					}
+				}
 			}
 		}
 		mutex.Unlock()
